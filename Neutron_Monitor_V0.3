@@ -129,4 +129,176 @@ local function drawGraph(x, y, w, h, series, title, colorTitle)
   -- Clear area
   out.setTextColor(colors.gray)
   for row = top, bottom do
-    out.setCursorPos(x,
+    out.setCursorPos(x, row)
+    out.write(string.rep(" ", w))
+  end
+
+  -- Zero line (ASCII '-' ONLY)
+  local zeroRow = top + math.floor((h - 1) / 2)
+  out.setTextColor(colors.gray)
+  out.setCursorPos(x, zeroRow)
+  out.write(string.rep("-", w))
+
+  -- Draw points (last w columns)
+  local start = math.max(1, #series - w + 1)
+  local col = 0
+  for i = start, #series do
+    col = col + 1
+    local v = series[i]
+    local norm = v / m
+    local rowOffset = math.floor(norm * ((h - 1) / 2))
+    local r = clamp(zeroRow - rowOffset, top, bottom)
+
+    out.setCursorPos(x + col - 1, r)
+    if v >= 0 then
+      out.setTextColor(colors.lime)
+      out.write("|")
+    else
+      out.setTextColor(colors.red)
+      out.write("|")
+    end
+  end
+
+  -- Scale line
+  out.setTextColor(colors.lightGray)
+  out.setCursorPos(x, bottom + 1)
+  local legend = ("scale +/- %d"):format(m)
+  if #legend > w then legend = legend:sub(1, w) end
+  out.write(legend .. string.rep(" ", math.max(0, w - #legend)))
+end
+
+--------------------------
+-- State
+--------------------------
+local secSeries = {}
+local minSeries = {}
+local lastCount = nil
+local lastMinMark = nil
+local minAccum = 0
+local zeroProdSec = 0
+
+--------------------------
+-- Keys
+--------------------------
+local function handleKey(e, key)
+  if e == "key" then
+    if key == keys.c then
+      CONTINUE_COLLECTING = not CONTINUE_COLLECTING
+    elseif key == keys.q then
+      clear()
+      error("Stopped by user (q).")
+    end
+  end
+end
+
+--------------------------
+-- Main loop
+--------------------------
+clear()
+
+while true do
+  local t0 = nowSec()
+
+  local count, realName, allCount, slotsUsed, slotsMax = getDrawerStats()
+
+  if not lastCount then
+    lastCount = count
+    lastMinMark = t0
+  end
+
+  -- delta per second
+  local delta = count - lastCount
+  lastCount = count
+
+  if CONTINUE_COLLECTING then
+    table.insert(secSeries, delta)
+    if #secSeries > SEC_HISTORY then table.remove(secSeries, 1) end
+    minAccum = minAccum + delta
+  else
+    table.insert(secSeries, 0)
+    if #secSeries > SEC_HISTORY then table.remove(secSeries, 1) end
+  end
+
+  -- minute tick
+  local elapsedMin = t0 - lastMinMark
+  if elapsedMin >= 60 then
+    table.insert(minSeries, minAccum)
+    if #minSeries > MIN_HISTORY then table.remove(minSeries, 1) end
+    minAccum = 0
+    lastMinMark = lastMinMark + (math.floor(elapsedMin / 60) * 60)
+  end
+
+  -- Alerts
+  if CONTINUE_COLLECTING then
+    if delta <= 0 then zeroProdSec = zeroProdSec + 1 else zeroProdSec = 0 end
+  else
+    zeroProdSec = 0
+  end
+
+  local avgMin = avg(minSeries)
+  local underperf = false
+  if EXPECTED_PER_MIN > 0 and #minSeries >= 3 then
+    underperf = (avgMin < (EXPECTED_PER_MIN * UNDERPERF_RATIO))
+  end
+
+  -- Draw UI
+  local w, h = out.getSize()
+  clear()
+
+  out.setCursorPos(1,1)
+  out.setTextColor(colors.white)
+  out.write("NEUTRON PILE - DASHBOARD")
+
+  out.setCursorPos(1,2)
+  out.setTextColor(colors.lightGray)
+  local status = CONTINUE_COLLECTING and "ON" or "PAUSE"
+  local line2 = ("Item: %s"):format(tostring(realName or ITEM_MATCH))
+  out.write(line2:sub(1, w))
+
+  out.setCursorPos(1,3)
+  out.setTextColor(colors.lightGray)
+  local line3 = ("Drawer(neutron_pile): %d | Slots: %d/%d | Mode: %s (c toggle, q quit)")
+    :format(count, slotsUsed, slotsMax, status)
+  out.write(line3:sub(1, w))
+
+  out.setCursorPos(1,4)
+  out.setTextColor(colors.white)
+  local line4 = ("Delta/s: %+d | Buffer(min): %+d | Drawer(all): %d")
+    :format(delta, minAccum, allCount)
+  out.write(line4:sub(1, w))
+
+  local alertMsg, alertColor
+  if zeroProdSec >= ZERO_PROD_SEC_LIMIT then
+    alertMsg = "ALERTE: PRODUCTION NULLE (verifie route->drawer / lock / bus ME)"
+    alertColor = colors.red
+  elseif underperf then
+    alertMsg = ("ALERTE: SOUS-PROD (moy %.1f/min < %.1f/min)"):format(avgMin, EXPECTED_PER_MIN)
+    alertColor = colors.orange
+  else
+    alertMsg = "OK: production normale"
+    alertColor = colors.lime
+  end
+
+  out.setCursorPos(1,5)
+  out.setTextColor(alertColor)
+  out.write(alertMsg:sub(1, w))
+
+  -- Graph layout
+  local graphTop = 7
+  local graphHeight = math.floor((h - graphTop - 2) / 2)
+  if graphHeight < 4 then graphHeight = 4 end
+
+  drawGraph(1, graphTop, w, graphHeight, secSeries,
+    "GRAPH: Delta / SECOND (last "..SEC_HISTORY.."s)", colors.cyan)
+
+  drawGraph(1, graphTop + graphHeight + 2, w, graphHeight, minSeries,
+    "GRAPH: Delta / MINUTE (last "..MIN_HISTORY.."m)", colors.yellow)
+
+  -- Wait + handle keys
+  local timer = os.startTimer(SAMPLE_SEC)
+  while true do
+    local e, p1 = os.pullEvent()
+    if e == "timer" and p1 == timer then break end
+    handleKey(e, p1)
+  end
+end
