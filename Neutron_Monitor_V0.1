@@ -1,0 +1,295 @@
+-- Neutron Pile Production Monitor (Drawer -> ME)
+-- cc:Tweaked
+
+--------------------------
+-- CONFIG
+--------------------------
+local DRAWER_NAME = "functionalstorage:drawer_1"  -- <- change: peripheral name of the drawer
+local ITEM_MATCH  = "avaritia:neutronium"         -- <- partial match is OK; we search in drawer slots
+local MONITOR_NAME = "monitor_0"                  -- <- set nil to use terminal
+
+-- Graph settings
+local SEC_HISTORY = 60        -- last 60 seconds
+local MIN_HISTORY = 60        -- last 60 minutes (1 hour)
+local SAMPLE_SEC  = 1         -- sample every 1 second
+
+-- Expected production check
+-- Put your expected rate here (in items per minute). If you don't know, set to 0 to disable.
+local EXPECTED_PER_MIN = 0
+
+-- Alert thresholds
+local ZERO_PROD_SEC_LIMIT = 20      -- if no increase for 20 seconds => alert
+local UNDERPERF_RATIO = 0.70        -- < 70% of expected => alert
+
+-- Control parameter
+local CONTINUE_COLLECTING = true    -- can be toggled in runtime with key 'c'
+
+--------------------------
+-- Helpers
+--------------------------
+local function clamp(v, a, b)
+  if v < a then return a end
+  if v > b then return b end
+  return v
+end
+
+local function avg(tbl)
+  if #tbl == 0 then return 0 end
+  local s = 0
+  for i=1,#tbl do s = s + tbl[i] end
+  return s / #tbl
+end
+
+local function maxAbs(tbl)
+  local m = 0
+  for i=1,#tbl do
+    local v = math.abs(tbl[i])
+    if v > m then m = v end
+  end
+  return m
+end
+
+local function nowSec()
+  return os.epoch("utc") / 1000
+end
+
+--------------------------
+-- Peripheral init
+--------------------------
+local drawer = peripheral.wrap(DRAWER_NAME)
+if not drawer then error("Drawer peripheral not found: "..tostring(DRAWER_NAME)) end
+
+local out
+if MONITOR_NAME then
+  out = peripheral.wrap(MONITOR_NAME)
+  if not out then error("Monitor not found: "..tostring(MONITOR_NAME)) end
+  out.setTextScale(0.5)
+else
+  out = term
+end
+
+local function clear()
+  out.setBackgroundColor(colors.black)
+  out.setTextColor(colors.white)
+  out.clear()
+  out.setCursorPos(1,1)
+end
+
+--------------------------
+-- Read item count from drawer
+--------------------------
+local function getItemCount()
+  -- Works for inventories: list() returns map slot->item {name,count,...}
+  local items = drawer.list()
+  local total = 0
+  local foundName = nil
+
+  for slot, it in pairs(items) do
+    if it and it.name then
+      if string.find(it.name, ITEM_MATCH, 1, true) then
+        total = total + (it.count or 0)
+        foundName = it.name
+      end
+    end
+  end
+
+  return total, foundName
+end
+
+--------------------------
+-- Graph rendering (ASCII bars)
+--------------------------
+local function drawGraph(x, y, w, h, series, title, colorTitle)
+  -- series is an array of numbers (newest at end)
+  -- We scale around 0 using maxAbs
+  local m = maxAbs(series)
+  if m < 1 then m = 1 end
+
+  -- Title
+  out.setCursorPos(x, y)
+  out.setTextColor(colorTitle or colors.cyan)
+  out.write(title .. string.rep(" ", math.max(0, w - #title)))
+
+  -- Frame area begins next line
+  local top = y + 1
+  local bottom = y + h
+
+  -- Clear area
+  out.setTextColor(colors.gray)
+  for row = top, bottom do
+    out.setCursorPos(x, row)
+    out.write(string.rep(" ", w))
+  end
+
+  -- zero line
+  local zeroRow = top + math.floor((h-1)/2)
+  out.setTextColor(colors.gray)
+  out.setCursorPos(x, zeroRow)
+  out.write(string.rep("-", w))
+
+  -- Draw last w points (or less)
+  local start = math.max(1, #series - w + 1)
+  local col = 0
+  for i = start, #series do
+    col = col + 1
+    local v = series[i]
+    local norm = v / m -- -1..1
+    local rowOffset = math.floor(norm * ((h-1)/2))
+    local r = clamp(zeroRow - rowOffset, top, bottom)
+
+    out.setCursorPos(x + col - 1, r)
+    if v >= 0 then
+      out.setTextColor(colors.lime)
+      out.write("|")
+    else
+      out.setTextColor(colors.red)
+      out.write("|")
+    end
+  end
+
+  -- Legend small
+  out.setTextColor(colors.lightGray)
+  out.setCursorPos(x, bottom + 1)
+  local legend = string.format("scale ±%d", m)
+  out.write(legend .. string.rep(" ", math.max(0, w - #legend)))
+end
+
+--------------------------
+-- State
+--------------------------
+local secSeries = {}  -- delta per second
+local minSeries = {}  -- delta per minute
+local lastCount = nil
+local lastSecTick = nil
+local lastMinMark = nil
+local minAccum = 0
+local zeroProdSec = 0
+
+--------------------------
+-- UI + loop
+--------------------------
+clear()
+
+-- For keyboard toggles on a computer (not turtle)
+local function handleKey(e, key)
+  if e == "key" then
+    if key == keys.c then
+      CONTINUE_COLLECTING = not CONTINUE_COLLECTING
+    elseif key == keys.q then
+      clear()
+      error("Stopped by user (q).")
+    end
+  end
+end
+
+while true do
+  local t0 = nowSec()
+  local count, realName = getItemCount()
+
+  if not lastCount then
+    lastCount = count
+    lastSecTick = t0
+    lastMinMark = t0
+  end
+
+  -- per-second delta
+  local delta = count - lastCount
+  lastCount = count
+
+  -- if "continue collecting" disabled, we still measure but mark as paused
+  if CONTINUE_COLLECTING then
+    table.insert(secSeries, delta)
+    if #secSeries > SEC_HISTORY then table.remove(secSeries, 1) end
+    minAccum = minAccum + delta
+  else
+    -- insert 0 to show pause visually
+    table.insert(secSeries, 0)
+    if #secSeries > SEC_HISTORY then table.remove(secSeries, 1) end
+  end
+
+  -- per-minute delta
+  local elapsedMin = t0 - lastMinMark
+  if elapsedMin >= 60 then
+    -- push one minute point
+    table.insert(minSeries, minAccum)
+    if #minSeries > MIN_HISTORY then table.remove(minSeries, 1) end
+    minAccum = 0
+    -- advance marker by multiples of 60 to avoid drift
+    lastMinMark = lastMinMark + (math.floor(elapsedMin / 60) * 60)
+  end
+
+  -- Alerts
+  if CONTINUE_COLLECTING then
+    if delta <= 0 then
+      zeroProdSec = zeroProdSec + 1
+    else
+      zeroProdSec = 0
+    end
+  else
+    zeroProdSec = 0
+  end
+
+  local avgMin = avg(minSeries)
+  local underperf = false
+  if EXPECTED_PER_MIN > 0 and #minSeries >= 3 then
+    underperf = (avgMin < (EXPECTED_PER_MIN * UNDERPERF_RATIO))
+  end
+
+  -- Draw UI
+  local w, h = out.getSize()
+  clear()
+
+  out.setCursorPos(1,1)
+  out.setTextColor(colors.white)
+  out.write("NEUTRON PILE - PRODUCTION DASHBOARD")
+
+  out.setCursorPos(1,2)
+  out.setTextColor(colors.lightGray)
+  local status = CONTINUE_COLLECTING and "ON" or "PAUSE"
+  out.write(string.format("Item: %s | Total: %d | Mode: %s  (c toggle, q quit)", tostring(realName or ITEM_MATCH), count, status))
+
+  out.setCursorPos(1,3)
+  out.setTextColor(colors.white)
+  out.write(string.format("Delta/s: %+d | Minute buffer: %+d", delta, minAccum))
+
+  -- Alerts line
+  local alertMsg = ""
+  local alertColor = colors.lime
+  if zeroProdSec >= ZERO_PROD_SEC_LIMIT then
+    alertMsg = "ALERTE: PRODUCTION NULLE (verifie connexions / drawer lock / item route)"
+    alertColor = colors.red
+  elseif underperf then
+    alertMsg = string.format("ALERTE: SOUS-PRODUCTION (moy %.1f/min < %.1f/min attendus)", avgMin, EXPECTED_PER_MIN)
+    alertColor = colors.orange
+  else
+    alertMsg = "OK: production semble normale"
+    alertColor = colors.lime
+  end
+  out.setCursorPos(1,4)
+  out.setTextColor(alertColor)
+  out.write(alertMsg:sub(1, w))
+
+  -- Graph zones
+  -- Reserve top 5 lines for text, bottom line for legend; split remaining area into two graphs
+  local graphTop = 6
+  local graphHeight = math.floor((h - graphTop - 2) / 2)
+  if graphHeight < 4 then graphHeight = 4 end
+
+  local gW = w
+  drawGraph(1, graphTop, gW, graphHeight, secSeries, "GRAPH: Delta per SECOND (last "..SEC_HISTORY.."s)", colors.cyan)
+  drawGraph(1, graphTop + graphHeight + 2, gW, graphHeight, minSeries, "GRAPH: Delta per MINUTE (last "..MIN_HISTORY.."m)", colors.yellow)
+
+  -- Footer help
+  out.setCursorPos(1, h)
+  out.setTextColor(colors.gray)
+  out.write("Tip: set EXPECTED_PER_MIN to detect bad setup. Increase history for smoother graph.")
+
+  -- Wait / handle events (keyboard + timer)
+  local delay = SAMPLE_SEC
+  local timer = os.startTimer(delay)
+  while true do
+    local e, p1 = os.pullEvent()
+    if e == "timer" and p1 == timer then break end
+    handleKey(e, p1)
+  end
+end
