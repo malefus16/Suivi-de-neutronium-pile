@@ -1,0 +1,132 @@
+-- Neutron Pile Production Dashboard (Avaritia) - Drawer monitor
+-- cc:Tweaked / ComputerCraft
+-- Tracks "avaritia:neutron_pile" inside a Functional Storage drawer
+-- Graphs: delta per second + delta per minute
+
+--------------------------
+-- CONFIG (ADAPT HERE)
+--------------------------
+local DRAWER_NAME  = "functionalstorage:jungle_1_0"
+local MONITOR_NAME = "monitor_11"               -- set nil to use terminal
+local ITEM_MATCH   = "avaritia:neutron_pile"    -- EXACT item name from your drawer
+
+-- Graph history
+local SEC_HISTORY = 60        -- last 60 seconds
+local MIN_HISTORY = 60        -- last 60 minutes
+local SAMPLE_SEC  = 1         -- sample every 1 second
+
+-- Expected production check (items per minute). Set 0 to disable.
+local EXPECTED_PER_MIN = 0
+local UNDERPERF_RATIO  = 0.70
+
+-- Alerts
+local ZERO_PROD_SEC_LIMIT = 20
+
+-- Runtime control
+local CONTINUE_COLLECTING = true -- toggle with key 'c'
+
+--------------------------
+-- Helpers
+--------------------------
+local function clamp(v, a, b)
+  if v < a then return a end
+  if v > b then return b end
+  return v
+end
+
+local function avg(tbl)
+  if #tbl == 0 then return 0 end
+  local s = 0
+  for i=1,#tbl do s = s + tbl[i] end
+  return s / #tbl
+end
+
+local function maxAbs(tbl)
+  local m = 0
+  for i=1,#tbl do
+    local v = math.abs(tbl[i])
+    if v > m then m = v end
+  end
+  return m
+end
+
+local function nowSec()
+  return os.epoch("utc") / 1000
+end
+
+--------------------------
+-- Peripheral init
+--------------------------
+local drawer = peripheral.wrap(DRAWER_NAME)
+if not drawer then error("Drawer peripheral not found: "..tostring(DRAWER_NAME)) end
+
+local out
+if MONITOR_NAME then
+  out = peripheral.wrap(MONITOR_NAME)
+  if not out then error("Monitor not found: "..tostring(MONITOR_NAME)) end
+  out.setTextScale(0.5)
+else
+  out = term
+end
+
+local function clear()
+  out.setBackgroundColor(colors.black)
+  out.setTextColor(colors.white)
+  out.clear()
+  out.setCursorPos(1,1)
+end
+
+--------------------------
+-- Read stats from drawer
+--------------------------
+-- matchCount = qty of ITEM_MATCH
+-- matchName  = exact name found
+-- allCount   = total qty of all items
+-- slotsUsed  = occupied slots
+-- slotsMax   = highest slot index seen
+local function getDrawerStats()
+  local items = drawer.list()
+  local matchCount, allCount = 0, 0
+  local slotsUsed, slotsMax = 0, 0
+  local matchName = nil
+
+  for slot, it in pairs(items) do
+    if type(slot) == "number" and slot > slotsMax then
+      slotsMax = slot
+    end
+    if it and it.name then
+      slotsUsed = slotsUsed + 1
+      allCount = allCount + (it.count or 0)
+      if it.name == ITEM_MATCH then
+        matchCount = matchCount + (it.count or 0)
+        matchName = it.name
+      end
+    end
+  end
+
+  if slotsMax < 1 then slotsMax = 1 end
+  return matchCount, matchName, allCount, slotsUsed, slotsMax
+end
+
+--------------------------
+-- Graph rendering
+--------------------------
+local function drawGraph(x, y, w, h, series, title, colorTitle)
+  -- safe scale
+  local m = maxAbs(series)
+  if m < 1 then m = 1 end
+
+  -- Title
+  out.setCursorPos(x, y)
+  out.setTextColor(colorTitle or colors.cyan)
+  local t = title
+  if #t > w then t = t:sub(1, w) end
+  out.write(t .. string.rep(" ", math.max(0, w - #t)))
+
+  local top = y + 1
+  local bottom = y + h
+
+  -- Clear area
+  out.setTextColor(colors.gray)
+  for row = top, bottom do
+    out.setCursorPos(x,
